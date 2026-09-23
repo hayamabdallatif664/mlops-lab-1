@@ -1,0 +1,22 @@
+# Local environments and caches
+.venv/
+**/__pycache__/
+**/*.py[cod]
+
+# Data and experiment tracking outputs (datasets come from DVC, models from MLflow)
+data/
+data.dvc
+.dvc/
+.dvcignore
+mlruns/
+mlflow.db
+
+# Version control and tooling
+.git/
+.gitignore
+.claude/
+
+# Not needed inside the image
+README.md
+Dockerfile
+.dockerignore
