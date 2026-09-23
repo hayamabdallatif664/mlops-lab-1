@@ -225,3 +225,149 @@ The best run is **`secretive-stoat-955`** (`--dataset mini --epochs 5 --lr 0.000
 **Best run ID (needed in the next lab): `23b406c4191c41eb8f440320bddf3ed8`**
 
 Its logged model lives at `mlruns/1/models/` under the model ID shown on the run's *Artifacts* tab, and can be loaded with `mlflow.pytorch.load_model("runs:/23b406c4191c41eb8f440320bddf3ed8/model")`.
+
+## Lab 3 - Containerizing the model with Docker
+
+### Question 1: What version number was your model given? What's the difference between a run's logged model artifact and a registered model?
+
+I registered the model of my best Lab 2 run (`secretive-stoat-955`, run ID `23b406c4191c41eb8f440320bddf3ed8`, `lr=0.0001`, `val_accuracy=0.7482`) from code with `mlflow.register_model("runs:/23b406c4191c41eb8f440320bddf3ed8/model", "food11")`. MLflow created the registered model `food11` and gave the model **version 1** (the first version of a newly created registered model). The "Models" tab shows `food11` with its latest version `Version 1`.
+
+MLflow printed: `Run with id 23b406c4... has no artifacts at artifact path 'model', registering model based on models:/m-90b969290a40482b94e511c41514b943 instead`. This is the MLflow 3 behaviour seen in Lab 2 Q6: `log_model` stores the model as a *LoggedModel* (`m-90b96929...`) under `mlruns/1/models/`, and the registry version points to it.
+
+- A **logged model artifact** is the output of one specific run: the files (`MLmodel`, weights, environment files) saved by `mlflow.pytorch.log_model`. It is identified by its run / model ID, every training run produces one, and it has no lifecycle of its own. It is just a record of "what this run produced".
+- A **registered model** is an entry in the Model Registry with a stable, human-readable name (`food11`) that groups **versions**. Each version points to one logged model and remembers its source run, but the registry adds a management layer on top: incrementing version numbers, aliases (`champion`), tags and descriptions. Consumers reference the name/alias instead of a run ID, so the model a service uses can be changed without touching the code.
+
+### Question 2: What aliases replaced the old built-in stages in mlflow? Why version a model separately from the run that produced it, and why is an alias more flexible than a fixed stage name?
+
+The fixed built-in stages `None` / `Staging` / `Production` / `Archived` are deprecated. They are replaced by **model version aliases**: free-form, user-defined names such as `champion` and `challenger` (the names used in the MLflow docs), plus free-form **tags** for any other metadata. I set the alias with `client.set_registered_model_alias("food11", "champion", 1)`, and `models:/food11@champion` now resolves to version 1.
+
+**Why version a model separately from the run:** a run is an experiment. There are many of them (5 in Lab 2), most are thrown away, and they are identified by opaque IDs. The registry holds only the models we decided are worth deploying, under one stable name with increasing version numbers. That separates "doing experiments" from "releasing models": you get a clean release history (v1, v2, ...) with a link back to the run for lineage, and anyone can consume `food11` without knowing which of dozens of runs produced it.
+
+**Why an alias is more flexible than a fixed stage:**
+- Aliases are arbitrary names, so they can match the team's own workflow (`champion`/`challenger`, `prod-eu`, `canary`, `shadow`) instead of four hard-coded stages.
+- An alias is a mutable pointer that can be moved to any version in one call. Promoting or rolling back is reassigning `champion` from v2 to v1, with no copying or re-registering, and consumers loading `models:/food11@champion` pick it up automatically.
+- A version can carry several aliases at once, and an alias always points to exactly one version, so the "current production model" is never ambiguous. With stages, several versions could sit in `Production`.
+
+### Question 3: Why load the model through an mlflow model URI (`models:/food11@champion`) instead of pointing directly at the `.pth` file on disk? What would you have to change to serve a newer model version?
+
+`src/food11/serve.py` loads the model once at startup with `mlflow.pyfunc.load_model(MODEL_URI)`, where `MODEL_URI` defaults to `models:/food11@champion` and `MLFLOW_TRACKING_URI` comes from an environment variable (default `http://127.0.0.1:5000`).
+
+Reasons to use the registry URI rather than a file path:
+- **Decoupling:** the serving code doesn't know or care where the weights are stored (local `mlruns/`, S3, a remote server...) or which run produced them. MLflow resolves `name@alias -> version -> artifact location` for us. A hard-coded `.pth` path ties the service to one file on one machine, which in particular doesn't exist inside a container.
+- **Loads everything needed, not just weights:** a `.pth` file only has tensors. The service would also need the exact model class code and to rebuild the architecture. The MLflow model contains the `MLmodel` metadata, the serialized model (`data/model.pt2`), its input/output signature (`float32 [-1, 3, 128, 128] -> [-1, 11]`) and its Python requirements, and `pyfunc` gives a uniform `predict()` interface whatever the framework.
+- **Governance and lineage:** what gets served is whichever version has been approved and given the `champion` alias, and each version links back to its run (params, metrics). You can always tell exactly which model is in production.
+
+I verified the local service end to end: sending all 1096 images of `food11_processed_mini/validation` to `POST /predict` gave 820 correct answers, **accuracy 0.7482**, exactly the `val_accuracy` logged for run `23b406c4...`. So the preprocessing in `serve.py` and the class order match training.
+
+**To serve a newer version:** register the new run's model (it becomes `food11` version 2), then move the alias: `client.set_registered_model_alias("food11", "champion", 2)`. Nothing changes in the code, the Docker image or the deployment config. The service only needs a **restart**, because it loads the model once at startup. (To pin a specific version for testing, the `MODEL_URI` environment variable could be set to e.g. `models:/food11/2` without rebuilding.)
+
+### Question 4: Why copy `pyproject.toml`/`uv.lock` and run `uv sync` *before* copying the rest of the source code? What happens to the build cache when you only change a line in `serve.py`?
+
+Docker caches every instruction as a layer. When it rebuilds, it reuses a layer only if the instruction **and everything before it** is unchanged (for `COPY`, the checksum of the copied files). The first layer that changes invalidates the cache for all the layers after it.
+
+The dependencies (`pyproject.toml`/`uv.lock`) change rarely, while the source code changes all the time, so the Dockerfile goes from least to most frequently changed:
+
+1. `COPY pyproject.toml uv.lock ./`
+2. `RUN uv sync --frozen --no-dev --no-install-project`, the slow step (downloading ~1 GB of wheels, including torch)
+3. (runtime stage) `COPY --from=builder /app/.venv ...`, then `COPY src/ ./src/` last
+
+If everything were copied at once (`COPY . .` before `uv sync`), *any* edit to `serve.py` would change that `COPY` layer, invalidate `uv sync` and reinstall every dependency.
+
+**What I measured:**
+- First build: **1577 s (26 min)**, almost all of it in `uv sync` downloading packages, because the network inside Docker's WSL VM is slow (~0.4 MB/s; torch alone took ~8 minutes).
+- Then I changed one line in `serve.py` (the FastAPI title) and rebuilt: **1 second**. The build log shows every step as `CACHED` (`COPY pyproject.toml uv.lock`, `uv sync`, `COPY --from=builder /app/.venv`), and only `[runtime 5/5] COPY src/ ./src/` was executed again.
+
+I also added `RUN --mount=type=cache,target=/root/.cache/uv` to the `uv sync` step. It keeps uv's downloaded wheels in a BuildKit cache that isn't part of the image, so even when `uv.lock` changes, only new or changed packages are downloaded. I added it after a first build failed at the very end (a bytecode-compile step timed out) and all 20 minutes of downloads were thrown away with the failed layer.
+
+### Question 5: What's the size difference between a naive single-stage image and your multi-stage one? Use `docker history <image>` to see which layers are the biggest.
+
+For the naive single-stage image I built stage 1 of the same Dockerfile on its own (`docker build --target builder -t food11-api:single-stage .`). That's what a single-stage build is: the full `python:3.14` image plus uv plus the venv, all kept in the final image. (It reused the cached `uv sync` layer, so it didn't need another 26-minute download.)
+
+| image | base | `docker images` size | real root filesystem (`du -sxh /`) | gcc inside |
+|---|---|---|---|---|
+| `food11-api:single-stage` | `python:3.14` | **3.51 GB** | 2.5 GB | yes |
+| `food11-api:latest` (multi-stage) | `python:3.14-slim` | **2.0 GB** | 1.5 GB | no |
+
+The multi-stage image is about **1.5 GB smaller (~43 %)**.
+
+`docker history` shows where the space goes:
+- **Biggest layer in both: the virtual environment, 1.44 GB** (`RUN uv sync ...` in the single-stage image, `COPY /app/.venv /app/.venv` in the multi-stage one). Inside it, torch alone is 711 MB, then pyarrow 152 MB, scipy 81 MB, mlflow 46 MB and pandas 42 MB.
+- **Only in the single-stage image:** the build tooling of the full Python image, i.e. one `apt-get install` layer of **694 MB** (gcc, make, dev headers...), others of 202 MB and 65 MB, a larger Debian base (134 MB vs 88 MB), plus the 55 MB `uv` binary. None of this is needed to *run* the API. The multi-stage build uses these tools in stage 1 and then copies only `/app/.venv` into a slim base, so they never reach the final image.
+
+The multi-stage image also has a smaller attack surface (no compiler or build tools) and runs as a non-root user (`app`, uid 1000).
+
+Two choices in `pyproject.toml` also keep the image small:
+- **CPU-only torch on Linux.** With the default lock, Linux `torch` pulls the CUDA 13 stack (15 `nvidia-*` packages + `triton`, ~3.6 GB of downloads), which would have made the image several GB larger with no benefit, since the container runs on CPU. I added the `pytorch-cpu` index **only for `sys_platform == 'linux'`**, so my Windows environment is unchanged (still `torch 2.14.0+cpu` from PyPI).
+- `uv sync --no-dev --no-install-project` installs only the runtime dependencies.
+
+### Question 6: What happens to build speed and image size if you forget the `.dockerignore`? Which of the excluded folders would actually break the build if they were sent to the Docker daemon?
+
+Before building anything, `docker build .` sends the whole **build context** (the folder) to the Docker daemon, which on Windows runs in a separate WSL VM. I measured what that would include:
+
+| folder | files | size |
+|---|---|---|
+| `data/` (raw + processed Food-11) | 36,578 | 1,216 MB |
+| `.dvc/` (DVC cache) | 32,042 | 1,167 MB |
+| `.venv/` (Windows virtualenv) | 34,003 | 1,062 MB |
+| `mlruns/` (5 logged models) | 36 | 221 MB |
+| `.git/`, `mlflow.db`, ... | ~70 | ~1 MB |
+| **total** | **~100,000** | **~3.7 GB** |
+
+With the `.dockerignore`, the build log shows `transferring context: 484B` for the first build (a few kB later): only `pyproject.toml`, `uv.lock` and `src/` are sent.
+
+- **Build speed:** without it, every build would first copy ~3.7 GB / 100k files into the VM, adding minutes even when every layer is cached. My cached rebuilds took 1-3 s. Any `COPY . .` would also change on every data or MLflow update and invalidate the cache.
+- **Image size:** with my Dockerfile, which only copies specific paths (`pyproject.toml uv.lock` and `src/`), the size wouldn't change much. With a typical `COPY . .` the image would grow by up to ~3.7 GB of datasets, DVC cache, models and a useless Windows venv. It would also bake in things that don't belong in an image: the dataset, `mlflow.db`, the git history.
+- **What would actually break the build: `.venv/`.** It's a *Windows* virtualenv (`Scripts/python.exe`, `.pyd`/`.dll` binaries, paths pointing to `C:\...`). If it's copied into the image, for example by a `COPY . .` after `uv sync`, it overwrites the Linux venv the builder created at `/app/.venv`. The container then has no Linux `python`/`uvicorn` under `/app/.venv/bin` and fails to start, or `uv sync` finds an incompatible environment. `__pycache__`/`*.pyc` files are compiled on the host and only add clutter. `data/`, `.dvc/` and `mlruns/` don't break anything; they make the build slow and the image huge.
+
+A mistake I caught: I first wrote `__pycache__/` in `.dockerignore`, but that pattern only matches at the root of the context, and `src/food11/__pycache__/*.pyc` (compiled on Windows) ended up in the image. The correct patterns are `**/__pycache__/` and `**/*.py[cod]`. After fixing it, `/app/src/food11` in the image contains only `data.py`, `serve.py` and `train.py`.
+
+### Question 7: Why can't the container simply use `127.0.0.1:5000` to reach the mlflow server on your host? What does `host.docker.internal` resolve to?
+
+A container has its **own network namespace**, and its own loopback interface. Inside the container, `127.0.0.1` means *the container itself*, not the Windows machine. My container had the address `172.17.0.3` on Docker's bridge network, and nothing listens on port 5000 inside it. Tested from inside a container:
+
+```
+http://127.0.0.1:5000/health            -> FAILED: [Errno 111] Connection refused
+http://host.docker.internal:5000/health -> OK
+```
+
+Running the image with `-e MLFLOW_TRACKING_URI=http://127.0.0.1:5000` fails at startup with `ConnectionRefusedError ... /api/2.0/mlflow/registered-models/alias?name=food11&alias=champion`. (On Linux, `--network host` avoids this by sharing the host's network namespace, so there `127.0.0.1` *is* the host. Docker Desktop on Windows/Mac runs containers inside a VM, which is why it provides `host.docker.internal` instead.)
+
+**`host.docker.internal`** is a special DNS name that Docker Desktop provides inside containers. In my container, `getent hosts host.docker.internal` returned **`192.168.65.254`**, an address on Docker Desktop's internal VM network that Docker forwards to the Windows host. That's how the container reaches the MLflow server listening on the host's `127.0.0.1:5000`.
+
+Making the container load the model took two more fixes that the lab's command alone doesn't cover:
+
+1. **MLflow 3 rejected the request:** `403 'Invalid Host header - possible DNS rebinding attack detected'`. The MLflow 3 server only accepts requests whose `Host` header is on an allow-list (localhost and private IPs by default), and the container sends `Host: host.docker.internal:5000`. Fix: start the server with `--allowed-hosts`:
+
+   ```
+   uv run mlflow server --host 127.0.0.1 --port 5000 --workers 1 --backend-store-uri sqlite:///mlflow.db --default-artifact-root ./mlruns --allowed-hosts "localhost,localhost:5000,127.0.0.1,127.0.0.1:5000,host.docker.internal,host.docker.internal:5000"
+   ```
+
+2. **The metadata was found but not the model files:** `MlflowException: No such artifact`. The tracking server only returns *metadata*. For the model files, the registry tells the client to read them directly from the artifact location, which with `--default-artifact-root ./mlruns` is a host path: `file:C:/Users/Pc/Projects/mlops-lab-1/mlruns/1/models/m-90b96929.../artifacts`. That path doesn't exist in a Linux container (on Linux, MLflow turns it into the relative path `/app/C:/Users/...`). Fix: bind-mount the host's `mlruns/` at exactly that path (PowerShell):
+
+   ```
+   docker run -p 8000:8000 -e MLFLOW_TRACKING_URI=http://host.docker.internal:5000 --mount "type=bind,source=C:\Users\Pc\Projects\mlops-lab-1\mlruns,target=/app/C:/Users/Pc/Projects/mlops-lab-1/mlruns" food11-api:latest
+   ```
+
+   (The mount can't be read-only: when loading a `models:/` URI from a local store, MLflow writes a small `registered_model_meta` file next to the model. It's the same 38-byte file the local run had already written.)
+
+With that, the container logs `Loading models:/food11@champion from http://host.docker.internal:5000` → `Model loaded`. The lab's `curl` works, and sending all 1096 validation images to the container gives **accuracy 0.7482**, the same as the local API and the training run. The cleaner long-term fix is an artifact store that the server serves over HTTP (`mlflow server --serve-artifacts --artifacts-destination ...`) or a remote store like S3/MinIO, so clients never need direct access to the server's disk.
+
+### Question 8: Stop the container and start a new one from the same image. Does the model still load correctly without you rebuilding? What does that tell you about what's baked into the image versus fetched at runtime?
+
+Yes. I stopped the container (`0a01f1904349`) and started a new one (`d329c34e2152`) from the **same image** (`6c4c207718f6`) without rebuilding. It started in ~11 s, logged `Loading models:/food11@champion from http://host.docker.internal:5000` → `Model loaded`, and predicted correctly (`Soup/9_0.jpg` → `Soup`, 0.9998).
+
+This shows the split between image and runtime:
+- **Baked into the image (immutable):** the OS and Python (`python:3.14-slim`), the dependencies (`/app/.venv`: torch, mlflow, fastapi...) and the code (`/app/src/food11/serve.py`). Inside the image, `/app` contains only `.venv` and `src/`. Searching it finds **no model weights** (no `model.pt2`, no `MLmodel`).
+- **Fetched at runtime, every time a container starts:** the model. `serve.py` asks the tracking server (address from the `MLFLOW_TRACKING_URI` environment variable) which version the `champion` alias points to, then loads that version's files from the artifact store. Nothing is cached inside the container, and a stopped container's state is thrown away.
+
+Consequences: the same image can serve a new model without rebuilding (move the `champion` alias, restart the container), and configuration comes from the environment (`-e`). But the container **depends on the tracking server and artifact store at startup**. With the MLflow server stopped or unreachable, the app fails to start (as the `127.0.0.1` test in Q7 shows). The image alone isn't enough to serve predictions.
+
+### Question 9: The Dockerfile and image are versioned differently — one lives in git, the other doesn't (yet). What's still missing before another machine (like a CI runner or a Kubernetes cluster) could reliably pull and run the exact image you just built?
+
+The Dockerfile in git is only a *recipe*. The image I built exists only in my local Docker Desktop, as `food11-api:latest`. What's missing:
+
+1. **A container registry.** The image has to be pushed (`docker tag` + `docker push`) to a registry that other machines can pull from: Docker Hub, GitHub Container Registry (`ghcr.io/hayamabdallatif664/food11-api`), or a cloud registry. Pushing needs `docker login` credentials, and pulling machines (CI, a Kubernetes cluster via `imagePullSecrets`) need access too.
+2. **An immutable, traceable tag instead of `latest`.** `latest` is a moving label: two machines pulling it at different times can get different images. The image should be tagged with something that identifies exactly what's in it, e.g. the git commit SHA or a version (`1.0.0`), and deployments should reference the **digest** (`food11-api@sha256:...`), which never changes.
+3. **An automated, reproducible build (CI).** A pipeline (e.g. GitHub Actions) that builds from a specific commit, runs tests, and pushes with the commit SHA tag. This creates the link between the git version and the image version. The build should also be reproducible: the base images (`python:3.14`, `python:3.14-slim`, `ghcr.io/astral-sh/uv:0.12.10`) could be pinned by digest (the dependencies are already pinned by `uv.lock` and `--frozen`).
+4. **Model artifacts other machines can reach.** Right now the container only works on my laptop, because it needs (a) the tracking server at `host.docker.internal:5000` and (b) the host's `mlruns/` folder mounted at a Windows-derived path. A CI runner or cluster needs an MLflow tracking server on a real network address with a shared artifact store (S3/MinIO/GCS, or `--serve-artifacts`), passed in through `MLFLOW_TRACKING_URI` (plus credentials as secrets).
+5. **The right platform/architecture.** The image is `linux/amd64`. ARM machines (Apple Silicon, some cloud nodes) would need a multi-arch build (`docker buildx build --platform linux/amd64,linux/arm64`).
