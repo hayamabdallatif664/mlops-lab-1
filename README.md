@@ -371,3 +371,177 @@ The Dockerfile in git is only a *recipe*. The image I built exists only in my lo
 3. **An automated, reproducible build (CI).** A pipeline (e.g. GitHub Actions) that builds from a specific commit, runs tests, and pushes with the commit SHA tag. This creates the link between the git version and the image version. The build should also be reproducible: the base images (`python:3.14`, `python:3.14-slim`, `ghcr.io/astral-sh/uv:0.12.10`) could be pinned by digest (the dependencies are already pinned by `uv.lock` and `--frozen`).
 4. **Model artifacts other machines can reach.** Right now the container only works on my laptop, because it needs (a) the tracking server at `host.docker.internal:5000` and (b) the host's `mlruns/` folder mounted at a Windows-derived path. A CI runner or cluster needs an MLflow tracking server on a real network address with a shared artifact store (S3/MinIO/GCS, or `--serve-artifacts`), passed in through `MLFLOW_TRACKING_URI` (plus credentials as secrets).
 5. **The right platform/architecture.** The image is `linux/amd64`. ARM machines (Apple Silicon, some cloud nodes) would need a multi-arch build (`docker buildx build --platform linux/amd64,linux/arm64`).
+
+## Lab 4 - Orchestrating the app with Docker Compose
+
+The stack has three services defined in `docker-compose.yml`:
+- **`mlflow`**: tracking server and registry, built from `mlflow/Dockerfile`, with data on the named volume `mlflow-data`.
+- **`inference`**: the Lab 3 image `food11-api:latest`, built from the root `Dockerfile`, with `MLFLOW_TRACKING_URI=http://mlflow:5000`.
+- **`frontend`**: a Streamlit upload page, built from `frontend/Dockerfile`, with `INFERENCE_URL=http://inference:8000`.
+
+**Changes compared to the lab handout** (each one fixes a problem I actually hit):
+1. **`mlflow/Dockerfile` uses `--serve-artifacts --artifacts-destination /mlflow-data/mlruns` instead of `--default-artifact-root /mlflow-data/mlruns`.** With a plain path, the registry would tell the inference container to read the model files directly from `/mlflow-data/mlruns`, a path that only exists inside the mlflow container. This is the `No such artifact` problem from Lab 3 Q7. With the artifact proxy, new runs get `mlflow-artifacts:/...` URIs and every client downloads (and uploads) model files over HTTP through `http://mlflow:5000`. My registered model's download URI was `mlflow-artifacts:/1/models/m-86de.../artifacts`.
+2. **`--allowed-hosts "mlflow,mlflow:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*"`.** The MLflow 3 server rejects requests whose `Host` header isn't on its allow-list (`403 Invalid Host header - possible DNS rebinding attack detected`, Lab 3 Q7). Inside Compose the inference service sends `Host: mlflow:5000`. I first listed fixed ports, and a test container on port 5001 got a 403, so I switched to the wildcard form the option supports.
+3. **`mlflow==3.16.0` is pinned** (the same version as the client in the inference image) instead of whatever "latest" pip picks. pip also gets a **BuildKit cache mount, `--timeout 120` and `--retries 10`** instead of `--no-cache-dir`. My internet connection was very slow (~0.1-0.3 MB/s), and the first build died after 49 minutes on a `ReadTimeoutError`, throwing away every download. With the cache mount, a retry resumes instead of starting over (the cache isn't part of the image).
+4. **`docker-compose.yml`: a healthcheck on `mlflow`, and `inference` waits with `depends_on: condition: service_healthy`** (see Q6). `inference` also has `image: food11-api:latest`, so Compose reuses and tags the Lab 3 image.
+5. **Aliases instead of stages.** The handout talks about moving versions to `Staging`, but stages are deprecated in MLflow 3 (Lab 3 Q2) and `serve.py` loads `models:/food11@champion`. So here the `champion` alias plays the role of "Staging", and no code had to change.
+
+The containerized MLflow starts **empty**: it has its own database on its own volume, not the Lab 2 `mlflow.db`. So I retrained the best Lab 2 configuration into it (`uv run python ./src/food11/train.py --dataset mini --epochs 5 --lr 0.0001 --batch-size 32`, logging to the published `http://127.0.0.1:5000`). It reproduced Lab 2 exactly (val_accuracy 0.7482, test_accuracy 0.7792, run `91a58e2e...`), and I registered it as `food11` **version 1** with alias `champion`.
+
+**End-to-end check:** from inside the frontend container I sent all 1096 validation images to `http://inference:8000/predict` and got **820/1096 = 0.7482** accuracy, the same as training. In the browser at `http://127.0.0.1:8501`, uploading `noodles_6_0.jpg` showed **"Prediction: Noodles-Pasta (83.1%)"**.
+
+(Local workaround, not part of the committed files: Docker Desktop's internal DNS failed to resolve `files.pythonhosted.org` (`[Errno -5] No address associated with hostname`), even though the Windows host and public DNS resolved it fine. I built the two new images with `docker build --add-host files.pythonhosted.org:<Fastly IP> -t mlops-lab-1-mlflow ./mlflow` (same for `frontend`), which are the image names Compose uses, and then ran `docker compose up -d`.)
+
+### Question 1: What happens to everything written to `/mlflow-data` if you never mount a volume there and just `docker run` this image standalone?
+
+It's written into the **container's writable layer** and is **lost when the container is removed**.
+
+I ran the image with no volume (`docker run -d --name q1-mlflow -p 5001:5000 mlops-lab-1-mlflow`). `docker inspect` showed `0` mounts, and `docker diff` showed the database being created inside the container's own layer:
+
+```
+A /mlflow-data
+A /mlflow-data/mlflow.db
+```
+
+I created an experiment `q1-persistence-test`, so the server listed `['q1-persistence-test', 'Default']`. Then I stopped and removed the container and started a new one from **the same image**. The UI and API showed only **`['Default']`**: the experiment was gone. The new container got a fresh writable layer on top of the image, and the image itself never contains runtime data.
+
+Stopping a container (without removing it) keeps its writable layer, but `docker rm`, `docker compose down`, or recreating the container after a config or image change throws it away. That's why the database and artifacts need a volume.
+
+### Question 2: Why a named volume here instead of a bind mount to a folder in your repo (the way you might for local dev)? Would a bind mount work just as well?
+
+A **named volume** (`mlflow-data:`) is storage that Docker creates and manages itself, inside Docker's own data area (on Docker Desktop, inside its WSL2 VM). A **bind mount** maps a specific host folder (e.g. `./mlflow-data`) into the container.
+
+Why a named volume fits the mlflow service better:
+- **Portable compose file:** it needs no host path, so the same `docker-compose.yml` works on any machine (Windows, Mac, Linux, a CI runner) without depending on the repo's folder layout or a path that has to exist first.
+- **Docker manages its lifecycle:** it's created automatically on the first `up`, survives `docker compose down` (and container removal and rebuilds), and is only deleted on purpose with `docker compose down -v` / `docker volume rm`. It's also easy to back up and inspect with `docker volume` commands.
+- **Ownership and permissions:** Docker initialises the volume with the container's view of the files (root inside the container), so there are no host-user/UID permission mismatches. With a bind mount on Linux, files created by root in the container end up root-owned in your repo.
+- **Performance and correctness on Windows/Mac:** a bind mount from the Windows filesystem into the Linux VM goes through a file-sharing layer that is much slower and has weaker file-locking semantics. That's bad for SQLite (`mlflow.db`), which relies on file locks. A named volume lives natively on the VM's Linux filesystem.
+- **Keeps runtime data out of the repo:** the database and model artifacts are runtime state, not source code. Just like `mlflow.db`/`mlruns/` in Lab 2, they shouldn't sit in the git working tree, where they'd need `.gitignore` and `.dockerignore` entries to stay out of commits and build contexts.
+
+**Would a bind mount work?** Functionally, yes: `./mlflow-data:/mlflow-data` would also persist the database and artifacts across `down`/`up`. It's handy for local development when you *want* to see or edit the files directly on the host. But it ties the compose file to a host path, is slower (and riskier for SQLite) on Docker Desktop, can cause permission problems, and puts runtime data inside the repository. For a service's own state, a named volume is the better default.
+
+### Question 3: In this lab, `MLFLOW_TRACKING_URI` will simply be `http://mlflow:5000`. Why does that hostname resolve now when it didn't before?
+
+Docker Compose creates a **user-defined bridge network** for the project (`mlops-lab-1_default`, 172.19.0.0/16) and attaches every service to it. On user-defined networks, Docker runs an **embedded DNS server** (`127.0.0.11`, the `nameserver` in each container's `/etc/resolv.conf`). It resolves each **service name** (and container name) to that container's IP on the network.
+
+From inside the frontend container:
+
+```
+mlflow     -> 172.19.0.2
+frontend   -> 172.19.0.4
+GET http://mlflow:5000/health -> OK
+```
+
+In Lab 3, the container ran on Docker's *default* bridge network, which has no service-name DNS, and the MLflow server wasn't a container at all. It was a process on the Windows host, reachable only through the special `host.docker.internal` name. A container that isn't on the Compose network still can't resolve the name: `docker run --rm python:3.11-slim ...gethostbyname('mlflow')` → `Name or service not known`.
+
+Two more details I observed:
+- The embedded DNS only answers for **running** containers. While `inference` was stopped, `inference` didn't resolve from the frontend.
+- The MLflow server must also accept the new `Host` header `mlflow:5000`, hence `--allowed-hosts` (change 2 above). Without it, the name would resolve but the server would answer 403.
+
+### Question 4: Why does the frontend read `INFERENCE_URL` from an environment variable instead of hardcoding `http://inference:8000`?
+
+Because the name `inference` only exists **inside this Compose network**. Configuration that depends on where the container runs belongs in the environment, not in the image ("build once, configure at run time").
+
+I ran the frontend image standalone with `docker run` and a small probe of `INFERENCE_URL + "/health"`:
+
+| run | `INFERENCE_URL` | result |
+|---|---|---|
+| no env var (default) | `http://127.0.0.1:8000` | `ConnectionError ... Failed to establish a new connection` (inside the container, 127.0.0.1 is the container itself, Lab 3 Q7) |
+| hardcoded Compose name | `http://inference:8000` | `NameResolutionError ... Failed to resolve 'inference'` (no Compose DNS outside the Compose network) |
+
+With a hardcoded `http://inference:8000`, the image would only work inside a Compose project whose service happens to be called `inference`. With an environment variable, the **same image** works everywhere: in Compose (`INFERENCE_URL: http://inference:8000`), standalone against the Lab 3 container (`-e INFERENCE_URL=http://host.docker.internal:8000`), in Kubernetes (`http://food11-inference.default.svc:8000`), or locally with `streamlit run` and the default `127.0.0.1`. Nothing is rebuilt just to point it somewhere else. It's the same reasoning as `MLFLOW_TRACKING_URI` in `serve.py`.
+
+### Question 5: Only `mlflow` and `frontend` publish a port to the host. `inference` doesn't. Why not, and how does the frontend still reach it?
+
+`ports:` publishes a container port **on the host** (here `0.0.0.0:8501` and `0.0.0.0:5000`). That's only needed for traffic coming from *outside* Docker: a human's browser opening the frontend, the MLflow UI, and in my case `train.py` on Windows logging runs to `http://127.0.0.1:5000`.
+
+Nobody outside the stack needs to call the inference API directly. Only the frontend does, and that traffic stays **inside the Compose network**: the frontend calls `http://inference:8000`, Compose DNS resolves `inference` to its container IP, and the request goes straight to port 8000 on that container. Containers on the same network can reach each other on any port the process listens on; publishing isn't involved.
+
+Not publishing it is also good practice. It reduces the attack surface (the model API can't be reached from the host or LAN), avoids port clashes on the host, and forces all traffic through the intended entry point.
+
+I tested the API from inside the network (`docker compose exec frontend python ... http://inference:8000/predict`), since it can't be reached from the host.
+
+### Question 6: `depends_on` only waits for the mlflow *container process* to start, not for the tracking server inside it to be ready. If `serve.py` tries to load the model at startup and mlflow isn't ready yet, what happens to the `inference` container?
+
+`serve.py` loads the model in FastAPI's startup (`lifespan`). If that raises an exception, uvicorn prints `ERROR: Application startup failed. Exiting.` and the process exits with **code 3**. The container stops (`Exited (3)`) and, because there's no `restart:` policy, **it stays down**. The frontend keeps running, but every upload fails because `inference` doesn't answer (it doesn't even resolve while stopped, Q3).
+
+What I observed:
+- **mlflow not reachable at startup:** I stopped `mlflow` and restarted only `inference`. It didn't fail instantly. It sat in `Loading models:/food11@champion from http://mlflow:5000` for over a minute, because the MLflow client retries failed HTTP requests by itself (`MLFLOW_HTTP_REQUEST_MAX_RETRIES=7`, backoff factor 2, roughly 2 minutes in total). When I started mlflow again within that window, the load succeeded (`Model loaded`). If mlflow is still not ready when the retries run out, startup fails with exit code 3.
+- **mlflow ready but the model isn't there:** on the very first `docker compose up` (a fresh, empty registry), inference failed immediately: `RestException: RESOURCE_DOES_NOT_EXIST: Registered Model with name=food11 not found` → `Application startup failed. Exiting.` → `Exited (3)`. The same happened after `down -v` (Q10). That error isn't retried.
+- mlflow takes several seconds after its container starts before `/health` answers. That's the window in which the lab's plain `depends_on: [mlflow]` would start inference too early.
+
+**How I handled it:** a `healthcheck` on `mlflow` (a Python `urllib` call to `http://localhost:5000/health` every 5 s; the slim image has no `curl`), plus `depends_on: mlflow: condition: service_healthy` on `inference`. `docker compose up` now prints `mlflow-1 Waiting` → `mlflow-1 Healthy` before `inference-1 Starting`. Other options are a retry loop in the app or `restart: on-failure`. A restart policy alone would put the container in a crash loop while the model is missing.
+
+### Question 7: Run `docker compose ps`. Which services have a published port listed, and which don't?
+
+```
+NAME                      IMAGE                  SERVICE     STATUS                    PORTS
+mlops-lab-1-frontend-1    mlops-lab-1-frontend   frontend    Up 8 minutes              0.0.0.0:8501->8501/tcp, [::]:8501->8501/tcp
+mlops-lab-1-inference-1   food11-api:latest      inference   Up About a minute         8000/tcp
+mlops-lab-1-mlflow-1      mlops-lab-1-mlflow     mlflow      Up 39 seconds (healthy)   0.0.0.0:5000->5000/tcp, [::]:5000->5000/tcp
+```
+
+- **`frontend`** and **`mlflow`** show a host mapping (`0.0.0.0:8501->8501`, `0.0.0.0:5000->5000`, plus the IPv6 `[::]` equivalents). They're published and reachable from the host at `127.0.0.1:8501` / `127.0.0.1:5000`.
+- **`inference`** shows only `8000/tcp`, with no `->` mapping. That's the port declared by `EXPOSE 8000` in the Lab 3 Dockerfile: documented and reachable from other containers on the network, but not published on the host.
+
+That matches `docker-compose.yml` exactly: only `mlflow` and `frontend` have a `ports:` section. `ps` also shows `inference` running the Lab 3 image `food11-api:latest` and `mlflow` as `(healthy)` thanks to the healthcheck.
+
+### Question 8: Promote a new model version. Does the prediction come from the new model version, or the old one? What single command lets you pick up the new version without rebuilding any image?
+
+I trained a second, deliberately different model into the containerized MLflow (`--lr 0.001`, val_accuracy 0.5484), registered it as `food11` **version 2**, and moved the alias: `champion -> 2` (the "Staging" role here, see change 5).
+
+**Before restarting**, the running service still served the **old model** (v1):
+- `Noodles-Pasta/6_0.jpg` → `Noodles-Pasta`, confidence **0.831**
+- whole validation set: **820/1096 = 0.7482**, v1's accuracy
+
+`serve.py` resolves `models:/food11@champion` **once, at startup**, and keeps that model object in memory. Moving the alias in the registry doesn't notify the running process.
+
+**The single command:**
+
+```bash
+docker compose restart inference
+```
+
+The logs show `Loading models:/food11@champion from http://mlflow:5000` → `Model loaded`, and now:
+- `Noodles-Pasta/6_0.jpg` → `Noodles-Pasta`, confidence **0.9997**
+- whole validation set: **601/1096 = 0.5484**, exactly v2's logged `val_accuracy`
+
+Afterwards I moved `champion` back to v1 (the better model) and restarted again.
+
+### Question 9: Why does `restart` alone work here, with no rebuild? What does that tell you about what's baked into the inference image versus fetched at container startup?
+
+Because **the model isn't in the image**. As in Lab 3 Q8, the image only contains the OS, Python, the dependencies (`/app/.venv`) and the code (`serve.py`). The model is **fetched at container startup**:
+1. `serve.py` reads `MLFLOW_TRACKING_URI` (`http://mlflow:5000`) and `MODEL_URI` (`models:/food11@champion`) from the environment.
+2. It asks the registry which version the alias points to *right now*.
+3. It downloads that version's files through the artifact proxy (`mlflow-artifacts:/...`) and loads them.
+
+`docker compose restart` stops and starts the **same container** (same image, same config, no rebuild, no recreate), so step 2 simply gets a different answer after the alias moved. The image is a generic "food11 server" and **the registry decides which model it serves**. Releasing or rolling back a model is a registry operation plus a restart, not a code change or image build. The trade-off is that `inference` can't start without a reachable MLflow and a valid `champion` version (Q6, Q10).
+
+### Question 10: Is your registered model and its Staging assignment still there after this `down`/`up` cycle? Now try `docker compose down -v` followed by `docker compose up`: what's different this time, and why?
+
+**`docker compose down` → `up`: everything is still there.**
+- `down` removed the three containers and the network `mlops-lab-1_default`, but the volume `mlops-lab-1_mlflow-data` still existed (`docker volume ls`).
+- After `up`, the new mlflow container mounted the same volume: `food11` versions `[1, 2]` with `{'champion': '1'}`, both runs in the `food11` experiment, and inference loaded the champion again (**820/1096 = 0.7482**).
+
+**`docker compose down -v` → `up`: everything is gone.**
+- `-v` also removes the named volumes declared in the compose file: `Volume mlops-lab-1_mlflow-data Removed`.
+- The next `up` printed `Volume mlops-lab-1_mlflow-data Creating`, a brand-new **empty** volume. MLflow created a fresh database: experiments `['Default']` only, registry `RESOURCE_DOES_NOT_EXIST: Registered Model with name=food11 not found`.
+- So `inference` failed at startup again: `Application startup failed. Exiting.` → `Exited (3)`, while `mlflow` and `frontend` were up.
+
+The containers are disposable, and the **volume is the only place the state lives**. `down` keeps it, `down -v` deletes it. In DVC terms, `down -v` is like deleting the cache and the remote: nothing is left to check out. To recover, I'd have to retrain/re-log the model and register it again (or restore a backup of the volume). The Lab 2 data on the host (`mlflow.db`, 888,832 bytes, and the 36 files in `mlruns/`) was unchanged, because it's completely separate storage.
+
+### Question 11: This compose file is still meant to run on one machine. What would have to change for the `inference` service to run as three replicas behind a load balancer, or for the mlflow service to survive a machine failure?
+
+Docker Compose is a **single-host** tool: every container runs on the one Docker engine of one machine, and it only restarts containers when they exit. What it can't provide:
+
+**Three `inference` replicas behind a load balancer**
+- Compose can start copies on the same machine (`docker compose up --scale inference=3`, or `deploy.replicas: 3`). Its DNS then returns all three IPs for `inference`, but that's simple DNS round-robin with no health-aware load balancing. If the machine dies, all three replicas die with it.
+- What's needed is an **orchestrator** that schedules replicas across **several machines** (e.g. Kubernetes `Deployment` with `replicas: 3`), a **load balancer / Service** that spreads traffic only to *healthy* replicas (readiness probes, e.g. on `/health` once the model has loaded), and rolling updates so a new model or image can be rolled out without downtime.
+- The image must come from a **registry** every node can pull from (Lab 3 Q9), not from a local build.
+
+**`mlflow` surviving a machine failure**
+- Its state currently lives in a **named volume on one machine's disk** and in a **SQLite file**. If that machine fails, the registry, runs and models are gone or unreachable. SQLite also can't be shared safely by several server instances.
+- What's needed: move the state off the machine, using a **managed/replicated database** (PostgreSQL/MySQL, e.g. a cloud database with backups and failover) as `--backend-store-uri`, and an **object store** (S3, GCS, Azure Blob, MinIO) as the `--artifacts-destination`. The mlflow server itself then becomes stateless and can run as several replicas on different nodes behind a load balancer, rescheduled automatically by the orchestrator if a node dies.
+- Plus the things a production setup expects and Compose doesn't give: cross-node service discovery and networking, secrets management (DB passwords, S3 keys), autoscaling, health-based self-healing across machines, and monitoring.
+
+In short, Compose describes *what* runs together on one host. Running replicas and surviving failures needs a multi-node orchestrator (Kubernetes, or Docker Swarm with `docker stack deploy`) plus external, replicated storage for the stateful parts.
