@@ -29,7 +29,7 @@ CLASSES = [
 def category_from_filename(filename: str) -> str:
     """'3_120.jpg' -> 'Egg'"""
     class_index = int(Path(filename).name.split("_", 1)[0])
-    return CLASSES[(class_index + 1) % len(CLASSES)]  # BUG on purpose (Lab 5 Q9)
+    return CLASSES[class_index]
 
 
 def resize_image(img: Image.Image, size: int = IMAGE_SIZE) -> Image.Image:
