@@ -545,3 +545,177 @@ Docker Compose is a **single-host** tool: every container runs on the one Docker
 - Plus the things a production setup expects and Compose doesn't give: cross-node service discovery and networking, secrets management (DB passwords, S3 keys), autoscaling, health-based self-healing across machines, and monitoring.
 
 In short, Compose describes *what* runs together on one host. Running replicas and surviving failures needs a multi-node orchestrator (Kubernetes, or Docker Swarm with `docker stack deploy`) plus external, replicated storage for the stateful parts.
+
+## Lab 5 - CI/CD with GitHub Actions
+
+What I added:
+- `src/food11/data.py` now exposes `CLASSES`, `category_from_filename()` and `resize_image()`, and the processing loop uses them. I checked that `resize_image` produces pixel-identical output to the old code, so the DVC-tracked data stays valid.
+- `src/food11/serve.py`: when `SKIP_MODEL` is set, startup skips loading the model, `/health` still returns 200, and `/predict` returns **503** while `model is None`. I kept FastAPI's `lifespan` handler from Lab 3 (the lab's `@app.on_event("startup")` is the older, deprecated form of the same thing). `serve.py` now imports `CLASSES` from `data.py` instead of keeping a second copy.
+- `tests/`: the lab's 3 data tests, `test_health`, `test_predict_returns_valid_json`, plus 2 extra API tests (503 without a model, 400 for a non-image upload), and the fixture `tests/fixtures/bread.jpg` (4 kB, in git). My `FakeModel.predict` returns **logits as a numpy array** (`[[4.0] + [0.0]*10]`), because that's what the real resnet18 pyfunc returns and `serve.py` applies the softmax itself. It also asserts the input shape is `(1, 3, 128, 128)`.
+- `pyproject.toml`: dev group (`pytest`, `ruff`, `httpx`), `[tool.pytest.ini_options] pythonpath = ["."]` so tests can `import src.food11...`, and `[tool.ruff.lint.isort] known-third-party = ["mlflow"]`. Without the last one, ruff mistakes the Lab 4 `mlflow/` folder for a local module. Fixing the ruff findings also changed `train.py` (an unused variable) and `serve.py` (`Annotated[UploadFile, File()]`).
+- `src/food11/validate_data.py` (data contract), `.github/workflows/ci.yml` (`test` → `smoke` → `push`), `src/food11/promote.py` (quality gate), `lab/lab5.md` (pipeline diagram).
+
+Locally: `uv run ruff check src tests` → `All checks passed!`, `uv run pytest -q` → `7 passed` in ~5 s (no GPU, no data, no MLflow).
+
+### Question 1: Why is it a bad idea for a unit test to load the real model from your MLflow server? List at least two ways the test could fail even though your code is correct.
+
+A unit test should check *my code*, quickly and the same way every time, anywhere. Loading the real model makes the result depend on things outside the code under test.
+
+Ways it fails with correct code:
+1. **The MLflow server isn't reachable.** On a GitHub runner, `http://127.0.0.1:5000` is the runner itself, and my server lives on my laptop. Locally it fails whenever the server isn't running. Lab 4 Q6 showed the client then retries for about 2 minutes before failing.
+2. **The registry state changed.** Someone moves `champion` to another version (Lab 4 Q8), or the alias or model doesn't exist (`RESOURCE_DOES_NOT_EXIST` after `docker compose down -v`, Lab 4 Q10). The expected prediction changes or the load fails, though no code changed.
+3. **The artifacts can't be fetched from where the test runs.** In Lab 3 the registry pointed at `file:C:/Users/Pc/...`, a Windows path that doesn't exist on a Linux runner (`No such artifact`).
+4. **Environment mismatch:** a different torch/mlflow version between the logged model and the test environment, or network timeouts while downloading the 45 MB model.
+
+It's also slow (import torch, download, deserialize), so tests stop being "a second". And the result mixes two questions: "is my code right?" and "is the current model good?". The second one is the job of the evaluation and the quality gate, not of unit tests.
+
+### Question 2: The fake model always answers "Bread" with 0.90 confidence. What exactly does `test_predict_returns_valid_json` prove, and what does it *not* prove?
+
+**What it proves (the code around the model):**
+- the app starts with `SKIP_MODEL=1`, and `/predict` is wired with the right method and multipart field name (`file`)
+- an uploaded JPEG is read and decoded with PIL, and preprocessing produces exactly the tensor the model expects (my fake asserts `x.shape == (1, 3, 128, 128)`)
+- the post-processing is correct: softmax over the logits, `argmax`, index 0 → `"Bread"` through `CLASSES`
+- the response has the agreed JSON contract: status 200, a `category` string, a `confidence` between 0 and 1
+
+**What it does not prove:**
+- **anything about the real model**: its accuracy, or whether it would recognise this image as bread. The fake answers "Bread" for any image, so the fixture being a bread photo doesn't matter.
+- that the real MLflow model **loads** and returns the same kind of output (logits as an array of shape `(1, 11)`). If the real model returned probabilities, a DataFrame or a different shape, this test would still pass.
+- that preprocessing matches training (resize, normalization constants). The fake ignores pixel values.
+- that the **class order** is right for every class. Only index 0 → Bread is exercised. If two other classes were swapped, the test wouldn't notice.
+- integration with MLflow, the network, performance, concurrency.
+
+So it's a **contract test of the API code**. Model quality is checked separately (evaluation, the quality gate). The integration is checked by the smoke test (for startup) and by the Lab 3/4 end-to-end runs, which gave 0.7482 accuracy over 1096 images.
+
+### Question 3: Which check caught it? Why is a train/test duplicate more dangerous than a corrupted image?
+
+`uv run python src/food11/validate_data.py data/food11_processed_mini` checks 3,292 images.
+
+**The real data already fails check 4**, before any change: the original Food-11 download contains byte-identical images in different splits. On the raw files too: raw `evaluation/0_131.jpg` and raw `training/0_106.jpg` have the same md5 (`730837e9f63d...`). There are **43 cross-split duplicate groups in the mini dataset** and **611 in the full dataset** (16,643 images, checked in 2 min 44 s). The other 4 checks pass on both:
+
+```
+  [PASS] 1. each split has exactly the 11 class folders
+  [PASS] 2. all 3292 images open, are RGB and 128x128
+  [PASS] 3. every class has >= 50 images per split (smallest: 96)
+  [FAIL] 4. no image (by content md5) appears in two splits
+           - evaluation/Bread/0_131.jpg == training/Bread/0_106.jpg
+           ...
+  [PASS] 5. class shares train vs validation within tau=0.05 (max gap 0.003)
+4/5 checks passed     (exit code 1)
+```
+
+Then I copied `training/Bread/0_0.jpg` into `evaluation/Bread/0_0_copy.jpg`. **Check 4 (no image in two splits, by md5) caught it.** The number of duplicate groups went from 43 to 44, and the new group is exactly `['evaluation/Bread/0_0_copy.jpg', 'training/Bread/0_0.jpg']`. Checks 1, 2, 3 and 5 still passed, since one extra image doesn't change folders, sizes, counts or balance in a visible way. I then deleted the copy (`evaluation/Bread` is back to 100 files).
+
+**Why a duplicate is more dangerous than a corrupted image:**
+- **A corrupted image fails loudly.** `train.py` crashes (check 2 also catches it), someone notices immediately, and it gets fixed. No wrong result is ever produced.
+- **A train/test duplicate fails silently.** Training runs normally and the metrics look *good*. The model has already seen those "test" images, so test accuracy is **inflated**: it measures memorisation on part of the test set instead of generalisation. Every decision built on that number is then biased: which hyperparameters win, and which version the quality gate promotes (the gate compares `test_accuracy`). The real drop shows up only in production, on images nobody has seen.
+
+This means my Lab 2 test accuracy (0.7792) is likely somewhat optimistic, because the evaluation split shares images with training. Fixing it means de-duplicating the raw data, re-processing, and creating a new DVC version. That's outside this lab, so I left the DVC data unchanged.
+
+### Question 4: Your CI runner cannot see your data. Where in your workflow should `validate_data.py` run so that it still protects you? Give two places.
+
+1. **In the data pipeline, before the data gets versioned:** right after `src/food11/data.py` produces `data/food11_processed*`, and before `dvc add data` / `git commit data.dvc` / `dvc push`. For example as a stage of a DVC pipeline (`dvc.yaml`: `process → validate → train`, so `dvc repro` stops when validation exits 1), or as a git pre-commit hook that runs when `data.dvc` changes. Bad data then never becomes a version anyone can check out.
+2. **At the start of every training run, on the machine that has the data:** as the first step before `train.py` (or called inside it), right after `dvc pull` / `dvc checkout`. It also protects against a stale or partial checkout. The run stops before wasting hours of training, and the result can be logged to MLflow (e.g. a tag `data_contract=pass` on the run).
+
+(A third option is a CI job that *does* get the data: store DagsHub credentials as GitHub secrets, `dvc pull` the mini dataset from the DagsHub remote in the runner, and run the contract on every change to `data.dvc`. Or use a self-hosted runner on the laptop. The script itself, with its PASS/FAIL logic, can also be unit-tested in CI on a tiny fake dataset built in a temp folder.)
+
+### Question 5: The `smoke` job has `needs: test`. What happens to it if a unit test fails? What would happen without `needs`?
+
+With `needs: test`, the jobs form a chain (`test` → `smoke` → `push`). If any step in `test` fails, the job fails and every job that depends on it is **skipped**: `smoke` never builds or starts the container, `push` doesn't publish anything, and the run is marked failed. In my successful runs they ran strictly one after another: `test` (24 s), then `smoke` (98 s), then `push` (264 s).
+
+Without `needs`, jobs run **in parallel** on separate runners. `smoke` would build and probe the image even though the tests failed, and could report green on its own. If `push` didn't depend on anything either, it could **publish an image built from code whose tests fail**, which is exactly what CI should prevent. It also wastes runner minutes on a build that will be thrown away. `needs` turns separate checks into a gate: each stage only runs on code that passed the earlier ones.
+
+### Question 6: How long did the whole run take? Run it a second time and compare. Which step got faster, and why?
+
+| | run 1 (commit `7dce957`) | run 2 (empty commit `63e5c16`) |
+|---|---|---|
+| **total (first job start → last job end)** | **390 s (6.5 min)** | **160 s (2.7 min)** |
+| `test` job | 24 s (`uv sync` 5 s, `pytest` 11 s) | 22 s (`uv sync` 3 s, `pytest` 12 s) |
+| `smoke` job | 98 s (`docker build` 78 s) | 106 s (`docker build` 84 s) |
+| `push` job | 264 s (`build-push-action` **230 s**) | 27 s (`build-push-action` **7 s**) |
+
+- **The `push` job got much faster (230 s → 7 s for the build).** `docker/build-push-action` uses `cache-from: type=gha` / `cache-to: type=gha,mode=max`. Run 1 stored every image layer in the GitHub Actions cache, and in run 2 nothing had changed (empty commit), so every layer, including the 1.4 GB venv, came from the cache and only had to be pushed to GHCR, where it already existed.
+- **`uv sync` got slightly faster (5 s → 3 s)** because `astral-sh/setup-uv` with `enable-cache: true` restores uv's download cache. It was already fast because Lab 3's CPU-only torch index makes the runner download the ~190 MB CPU wheel instead of ~3.6 GB of CUDA packages.
+- **`smoke` did not get faster** (78 s → 84 s, just noise). It uses a plain `docker build` with no cache configured, and every run starts from an empty machine (nothing from a previous run is there unless cached). It could use `docker/setup-buildx-action` with `cache-from: type=gha` too.
+
+### Question 7: Why tag with the commit SHA rather than `latest`? Describe a concrete situation where `latest` leads two machines to run different code.
+
+After run 1, the `push` job published `ghcr.io/hayamabdallatif664/mlops-lab-1:7dce957b0043a1b999b4d21df0208f7a5e017691` (the package is public, since the repo is public). I pulled it on my laptop with `docker pull` and ran it the way the smoke job does: `/health` → `{"status":"ok"}`, `/predict` → `503 {"detail":"Model not loaded"}`. Its digest is `sha256:d430255af05b...`.
+
+**Why the SHA:** a commit SHA tag is **immutable and traceable**. It always refers to the image built from exactly that commit. From any running container I can find the code (`git show 7dce957`), the CI run that built and tested it, and the tests that passed. Rolling back means deploying the previous SHA. `latest` is a **moving label**: it points to whatever was pushed last, so it says nothing about which code is inside, and its meaning changes over time.
+
+**Concrete situation:** the inference service runs on two servers behind a load balancer, both configured with `image: ghcr.io/.../mlops-lab-1:latest`.
+- Monday: server A starts and pulls `latest` = commit X.
+- Tuesday: a commit Y is merged that changes preprocessing (for example new normalization constants), and CI moves `latest` to Y.
+- Wednesday: server B is added (autoscaling, or a replacement after a crash) and pulls `latest` = Y. Server A still runs its cached X, since Docker doesn't re-pull an image it already has.
+
+Both servers report the "same version" (`latest`), yet the same photo gets different predictions depending on which server answers. Reproducing a bug is guesswork, and "roll back to the previous version" is impossible, because nobody knows which code was behind `latest` on Monday. With SHA tags each server runs a version you can read off, and they only change when someone deploys a new SHA on purpose.
+
+(This completes Lab 3 Q9: the image is now in a **registry** (GHCR), with an **immutable tag** (the commit SHA), produced by a **reproducible CI build**.)
+
+### Question 8: Why does the `push` job declare `permissions:` explicitly? What could a compromised step do with a token that had write access to everything in the repo?
+
+**Least privilege.** `GITHUB_TOKEN` gets the repository's *default* permissions unless the workflow says otherwise. Depending on repo and org settings, that's either read-only, which is too little for GHCR (pushing an image needs `packages: write`), or read and write to almost everything, which is far too much. A `permissions:` block sets exactly what the job gets: `contents: read` (to check out the code) and `packages: write` (to push the image), and **everything not listed becomes `none`**. The other jobs (`test`, `smoke`) never need to write anything.
+
+**What a compromised step could do with write access to everything:** the `push` job runs third-party code, namely the actions `docker/login-action` and `docker/build-push-action` (a hijacked version tag would run attacker code), plus every package installed during `docker build`. With a write-all token, that code could:
+- **push commits to the repository**, for example a backdoor in `serve.py` or `train.py`, or a modified `.github/workflows/ci.yml` that sends repository secrets to the attacker on the next run
+- create or move **tags and releases**, delete branches, rewrite what people download
+- open, approve, merge or comment on **pull requests and issues**, change GitHub Pages or deployments
+- publish malicious **packages/images** under the project's name
+
+With `contents: read` + `packages: write`, the worst it can do is push a bad image to this repo's package. That's still bad, but the code, history, workflows and PRs can't be changed. The token is also short-lived (it expires when the job ends), which limits how long a stolen token is useful. Pinning actions to a full commit SHA instead of `@v6` reduces this risk further.
+
+### Question 9: What does the pull request page show? Could you still merge? What does that change for a team compared to "everybody runs the tests on their laptop before pushing"?
+
+I protected `main` with a branch protection rule: **Require a pull request before merging**, **Require status checks to pass** with `test` and `smoke` as required checks, and **Do not allow bypassing the above settings**. GitHub's API then reports `"protected": true`, `"contexts": ["test", "smoke"]`, `"enforcement_level": "everyone"`. On the branch `break-category-test`, I made `category_from_filename` return the next class (`CLASSES[(class_index + 1) % len(CLASSES)]`), pushed, and opened **pull request #1**.
+
+**What the PR page showed:** a red box **"Some checks were not successful — 2 failing, 4 skipped checks"**:
+- `ci / test (pull_request)`: **Failing after 22s**, **Required**
+- `ci / test (push)`: **Failing after 21s**, **Required**
+- `ci / smoke (pull_request)` and `ci / smoke (push)`: **Skipped**, **Required** (they `needs: test`)
+- `ci / push (pull_request)` and `ci / push (push)`: Skipped (not required; it only runs on `main` anyway)
+
+There are two runs because the workflow triggers on both `push` (to the branch) and `pull_request`. The failing step was `uv run pytest -q`: `test_category_from_filename` failed because `"0_12.jpg"` became `"Dairy product"` instead of `"Bread"`.
+
+**Could I still merge? No.** The **Merge pull request** button was greyed out. Before the rule existed, on the same PR with the same red check, the button was active and the page said "Merging can be performed automatically", so the broken code could have gone straight onto `main`. And because the rule doesn't allow bypassing, even I as repository owner couldn't force it.
+
+I then pushed a fix to the same branch: `test` and `smoke` went green on the PR, the button became active, and the PR was merged.
+
+**What changes for a team:** "run the tests before pushing" relies on everybody remembering, having the same environment, and being honest about it. With required checks, it's **enforced by the server, not by goodwill**:
+- **Nobody can forget or skip it.** Every change to `main` has passed `test` and `smoke`, without exception, so `main` is always in a working, deployable state, and every image the `push` job builds comes from tested code.
+- **Same clean environment for everyone.** Tests run on a fresh runner from `uv.lock` (`uv sync --frozen`), not on a laptop with extra packages, local data or a running MLflow server. "Works on my machine" goes away.
+- **The result is visible.** Reviewers see the red or green checks on the PR before reading the code, and a failure is linked to the exact commit and log.
+- **It scales.** The more people push, the more valuable an automatic gate becomes. The cost is a few minutes of waiting per PR and keeping the tests reliable, since a flaky test now blocks everyone.
+
+One subtlety I noticed: GitHub treats a **skipped** required check as satisfied. If only `smoke` were required, a failing `test` would *skip* `smoke` and the PR would become mergeable. That's why `test` itself must also be a required check.
+
+### Question 10: For each candidate, what did the gate decide, and with which numbers? With your test-set size, how many accuracy points does `2 * se` represent?
+
+Current champion: `food11` **v1** (Lab 2 run `23b406c4...`, lr 1e-4), **test_accuracy = 0.7792** on **n = 1096** test images (the `test_images` param logged by `train.py`).
+
+```
+se        = sqrt(p (1 - p) / n) = sqrt(0.7792 * 0.2208 / 1096) = 0.0125
+threshold = acc_champion + 2 * se = 0.7792 + 0.0251 = 0.8043
+```
+
+I trained two new runs into the local MLflow server, registered them, and ran `uv run python src/food11/promote.py --version <n>` on each:
+
+| candidate | run | settings | test_accuracy | vs threshold 0.8043 | decision |
+|---|---|---|---|---|---|
+| **v2** | `f0d4ad38...` | lr **1e-5** (very small), 5 epochs | **0.5319** | 0.272 below | **not promoted** → alias `challenger`, `champion` stays v1 |
+| **v3** | `f33560b4...` | lr **1e-4** (best settings), 5 epochs | **0.7792** | 0.025 below | **not promoted** → alias `challenger`, `champion` stays v1 |
+
+In both cases `promote.py` wrote the decision and the numbers as tags on the candidate version. For v3: `gate_decision=challenger`, `gate_candidate_accuracy=0.7792`, `gate_champion_accuracy=0.7792`, `gate_champion_version=1`, `gate_se=0.0125`, `gate_threshold=0.8043`, `gate_n=1096`. Final registry state: `{'champion': '1', 'challenger': '3'}`. An alias points to a single version, so promoting v3 to challenger moved the alias away from v2, while the tags on v2 still record its decision.
+
+- v2 is clearly worse: with lr 1e-5, five epochs aren't enough to adapt the pretrained network.
+- v3 is **exactly as good** as the champion. It uses the same settings and the same `seed=42`, so training is deterministic on CPU and reproduces 0.7792. The gate refuses it, which is the point: a candidate has to be clearly better, not just equal or better by noise.
+
+**`2 * se` = 0.0251, i.e. about 2.5 accuracy points.** With 1096 test images, a candidate needs at least **80.43%** to replace a 77.92% champion, roughly **28 more correctly classified test images**. Differences smaller than that are within the statistical noise of a 1096-image test set (a ~95% band). The leakage found in Q3 means these test accuracies are optimistic for every model.
+
+### Question 11: `promote.py` needs to reach your MLflow server, so it cannot run in GitHub's cloud runners while MLflow lives on your laptop. Name two ways to make it run automatically after training.
+
+1. **Move the tracking server somewhere CI can reach: DagsHub's hosted MLflow.** Every DagsHub repository comes with an MLflow server (`https://dagshub.com/hayamabdallatif664/mlops-lab-1.mlflow`), the same repo that's already my DVC remote. `train.py` logs and registers there (`MLFLOW_TRACKING_URI` + DagsHub username/token as environment variables). A GitHub Actions workflow then runs `promote.py` in a normal cloud runner, with the URI and token stored as **repository secrets**. It can be started after training by `repository_dispatch` (training sends an event when it finishes), by `workflow_dispatch` with the version number as input, or on a schedule that checks for new versions. (The Lab 4 `mlflow` container deployed on a reachable server with a proper database and object store would work the same way.)
+2. **Run it where MLflow already is: chain it to training on the laptop.** For example a DVC pipeline (`dvc.yaml` stages `validate → train → register → promote`, run with `dvc repro`), or simply the end of the training script: register the new version and call the gate. Another option is a **self-hosted GitHub Actions runner** on the laptop, which can reach `127.0.0.1:5000`. Or an MLflow registry webhook / polling job that runs `promote.py` whenever a new model version is created.
+
+### Question 12: Draw the pipeline you now have, from `git push` to a running container.
+
+See [`lab/lab5.md`](lab/lab5.md): a Mermaid flowchart (GitHub renders it), plus a table of which steps are automatic, which need a human, and where the **code version** (the git commit SHA, which is also the image tag, decided when a commit lands on `main`) and the **model version** (the `champion` alias, decided by `promote.py`) are chosen. The two meet only at container startup, when `serve.py` loads `models:/food11@champion` inside the image `ghcr.io/hayamabdallatif664/mlops-lab-1:<sha>`.
