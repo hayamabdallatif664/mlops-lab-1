@@ -34,3 +34,20 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+]
+
+[tool.pytest.ini_options]
+# Run from the repo root so tests can `import src.food11...` like the Dockerfile does
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff.lint.isort]
+# The repo has a mlflow/ folder (the Lab 4 server image), which ruff would
+# otherwise mistake for a local "mlflow" module
+known-third-party = ["mlflow"]

@@ -149,7 +149,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset_dir = DATASET_DIRS[args.dataset]
 
-    train_loader, val_loader, test_loader, classes = build_dataloaders(
+    train_loader, val_loader, test_loader, _classes = build_dataloaders(
         dataset_dir, args.batch_size, args.num_workers
     )
 

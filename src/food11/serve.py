@@ -1,6 +1,7 @@
 import io
 import os
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import mlflow
 import mlflow.pyfunc
@@ -9,23 +10,12 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from PIL import Image, UnidentifiedImageError
 from torchvision import transforms
 
+# Already in alphabetical order, the same order torchvision's ImageFolder
+# assigned to the class folders during training
+from src.food11.data import CLASSES
+
 MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
 MODEL_URI = os.environ.get("MODEL_URI", "models:/food11@champion")
-
-# Same order as torchvision's ImageFolder assigned during training (sorted folder names)
-CLASSES = [
-    "Bread",
-    "Dairy product",
-    "Dessert",
-    "Egg",
-    "Fried food",
-    "Meat",
-    "Noodles-Pasta",
-    "Rice",
-    "Seafood",
-    "Soup",
-    "Vegetable-Fruit",
-]
 
 # Must match the evaluation transform used in train.py
 IMAGE_SIZE = (128, 128)
@@ -42,8 +32,13 @@ model = None
 
 @asynccontextmanager
 async def lifespan(app):
-    # Load the model once at startup, resolved through the Model Registry alias
+    # Load the model once at startup, resolved through the Model Registry alias.
+    # SKIP_MODEL lets tests and the CI smoke test start the API without MLflow.
     global model
+    if os.environ.get("SKIP_MODEL"):
+        print("SKIP_MODEL is set: starting without a model")
+        yield
+        return
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     print(f"Loading {MODEL_URI} from {MLFLOW_TRACKING_URI}")
     model = mlflow.pyfunc.load_model(MODEL_URI)
@@ -60,7 +55,10 @@ def health():
 
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(file: Annotated[UploadFile, File()]):
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     try:
         image = Image.open(io.BytesIO(await file.read())).convert("RGB")
     except UnidentifiedImageError:
